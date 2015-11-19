@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
-	"io/ioutil"
-	"github.com/mitallast/midibot/midi"
 	"fmt"
+	"github.com/mitallast/midibot/midi"
+	"io/ioutil"
 )
 
 func main() {
