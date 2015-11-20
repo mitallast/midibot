@@ -19,14 +19,44 @@ func main() {
 	midi.ReadMThd()
 	fmt.Println("mtrk 1")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Println("mtrk 2")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Println("mtrk 3")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Println("mtrk 4")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Println("mtrk 5")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Println("mtrk 6")
 	midi.ReadMTrk()
+	for midi.HasNextEvent() {
+		if err := midi.ReadNextEvent(); err != nil {
+			panic(err)
+		}
+	}
 }
