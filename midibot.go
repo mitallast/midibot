@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"github.com/mitallast/midibot/midi"
 	"io/ioutil"
 )
@@ -21,8 +22,10 @@ func main() {
 			panic(err)
 		}
 		for midi.HasNextEvent() {
-			if err := midi.ReadNextEvent(); err != nil {
+			if e, err := midi.ReadNextEvent(); err != nil {
 				panic(err)
+			} else {
+				fmt.Println(e)
 			}
 		}
 	}

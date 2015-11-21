@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 )
 
 var (
@@ -21,7 +20,7 @@ var (
 	errInvalidPatch               = errors.New("Invalid patch")
 	errInvalidAfterTouchPressure  = errors.New("Invalid after touch pressure")
 	errInvalidSmpteOffset         = errors.New("Invalid SMPTE Offset")
-	errVarInt32Overflow           = errors.New("binary: varint overflows a 64-bit integer")
+	errVarInt32Overflow           = errors.New("binary: varint overflows a 32-bit integer")
 )
 
 const (
@@ -65,21 +64,19 @@ const (
 
 type Midi struct {
 	buffer *bytes.Buffer
-	mthd   MidiMthd
-	mtrk   MidiMtrk
-
-	commandCode byte
-	channel     uint8
+	mthd   Mthd
+	mtrk   Mtrk
+	event  Event
 }
 
-type MidiMthd struct {
+type Mthd struct {
 	length   int32
 	format   int16
 	tracks   int16
 	division int16
 }
 
-type MidiMtrk struct {
+type Mtrk struct {
 	track    int16
 	length   int32
 	end_pos  int
@@ -92,7 +89,7 @@ func NewMidi(b *bytes.Buffer) *Midi {
 	}
 }
 
-func (midi *Midi) Mthd() MidiMthd {
+func (midi *Midi) Mthd() Mthd {
 	return midi.mthd
 }
 
@@ -114,10 +111,6 @@ func (midi *Midi) ReadMThd() error {
 		return err
 	}
 
-	fmt.Printf("format %d\n", midi.mthd.format)
-	fmt.Printf("tracks %d\n", midi.mthd.tracks)
-	fmt.Printf("length %d\n", midi.mthd.length)
-	fmt.Printf("division %d\n", midi.mthd.division)
 	return nil
 }
 
@@ -127,7 +120,6 @@ func (midi *Midi) HasNextMTrk() bool {
 
 func (midi *Midi) ReadNextMTrk() error {
 	midi.mtrk.track++
-	fmt.Printf("MTrk %d\n", midi.mtrk.track)
 	return midi.ReadMTrk()
 }
 
@@ -156,26 +148,7 @@ func (midi *Midi) ReadMTrkFormat1() error {
 	if err := binary.Read(midi.buffer, binary.BigEndian, &midi.mtrk.length); err != nil {
 		return err
 	}
-	fmt.Printf("mtrk length %d\n", midi.mtrk.length)
 	midi.mtrk.end_pos = midi.buffer.Len() - int(midi.mtrk.length)
-	return nil
-}
-
-func (midi *Midi) HasNextEvent() bool {
-	return midi.buffer.Len() > midi.mtrk.end_pos
-}
-
-func (midi *Midi) ReadNextEvent() error {
-	delta, err := midi.ReadUVarInt()
-	if err != nil {
-		return err
-	}
-	midi.mtrk.time_pos += delta
-	fmt.Printf("%d", midi.mtrk.time_pos)
-	if err := midi.ReadEvent(); err != nil {
-		return err
-	}
-	fmt.Print("\n")
 	return nil
 }
 
@@ -183,19 +156,33 @@ func (midi *Midi) ReadMTrkFormat2() error {
 	return errNotImplemented
 }
 
-func (midi *Midi) ReadEvent() error {
+func (midi *Midi) HasNextEvent() bool {
+	return midi.buffer.Len() > midi.mtrk.end_pos
+}
+
+func (midi *Midi) ReadNextEvent() (MidiEvent, error) {
+	var err error
+	if midi.event.delta, err = midi.ReadUVarInt(); err != nil {
+		return nil, err
+	}
+	midi.mtrk.time_pos += midi.event.delta
+	event, err := midi.ReadEvent()
+	return event, err
+}
+
+func (midi *Midi) ReadEvent() (MidiEvent, error) {
 	b, err := midi.buffer.ReadByte()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var commandCode byte
 	var channel uint8 = 1
 	if b&0x80 == 0 {
 		// a running command - command & channel are same as previous
-		commandCode = midi.commandCode
-		channel = midi.channel
+		commandCode = midi.event.commandCode
+		channel = midi.event.channel
 		if err := midi.buffer.UnreadByte(); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		if b&0xF0 == 0xF0 {
@@ -206,12 +193,10 @@ func (midi *Midi) ReadEvent() error {
 		}
 	}
 
-	midi.commandCode = commandCode
-	midi.channel = channel
+	midi.event.commandCode = commandCode
+	midi.event.channel = channel
 
-	fmt.Printf(", %d", midi.channel)
-
-	switch commandCode {
+	switch midi.event.commandCode {
 	case CommandCodeNoteOn:
 		return midi.ReadNoteOnEvent()
 	case CommandCodeNoteOff,
@@ -222,7 +207,7 @@ func (midi *Midi) ReadEvent() error {
 	case CommandCodePatchChange:
 		return midi.ReadPatchChangeEvent()
 	case CommandCodeChannelAfterTouch:
-		return midi.ReadChannelAfterTouchEvent()
+		return midi.ReadAfterTouchEvent()
 	case CommandCodePitchWheelChange:
 		return midi.ReadPitchWheelEvent()
 	case CommandCodeSysex:
@@ -232,134 +217,148 @@ func (midi *Midi) ReadEvent() error {
 		CommandCodeContinueSequence,
 		CommandCodeStopSequence:
 		// empty midi event
-		return nil
+		return nil, nil
 	case CommandCodeEox:
-		return errNotImplemented
+		return nil, errNotImplemented
 	case CommandCodeAutoSensing:
-		return errNotImplemented
+		return nil, errNotImplemented
 	case CommandCodeMetaEvent:
 		return midi.ReadMetaEvent()
 	default:
-		return errInvalidCommandCode
+		return nil, errInvalidCommandCode
 	}
 }
 
-func (midi *Midi) ReadSysexEvent() error {
+func (midi *Midi) ReadSysexEvent() (event MidiEvent, err error) {
+	data := []byte{}
 	for {
-		b, err := midi.buffer.ReadByte()
+		var b byte
+		b, err = midi.buffer.ReadByte()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if b == 0xF7 {
 			break
 		} else {
-			fmt.Printf(", %X", b)
+			data = append(data, b)
 		}
 	}
-	return nil
+	event = &SysexEvent{
+		midi.event,
+		data,
+	}
+	return
 }
 
-func (midi *Midi) ReadChannelAfterTouchEvent() error {
-	afterTouchPressure, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadAfterTouchEvent() (event MidiEvent, err error) {
+	var pressure byte
+	if pressure, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	if afterTouchPressure&0x80 != 0 {
-		return errInvalidAfterTouchPressure
+	if pressure&0x80 != 0 {
+		return nil, errInvalidAfterTouchPressure
 	}
-	fmt.Printf(", after touch pressure %d", afterTouchPressure)
-	return nil
+	event = &AfterTouchEvent{
+		midi.event,
+		pressure,
+	}
+	return
 }
 
-func (midi *Midi) ReadPatchChangeEvent() error {
-	patch, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadPatchChangeEvent() (event MidiEvent, err error) {
+	var patch byte
+	if patch, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
 	if patch&0x80 != 0 {
-		return errInvalidPatch
+		return nil, errInvalidPatch
 	}
-	fmt.Printf(", patch %d", patch)
-	return nil
+	event = &PatchChangeEvent{
+		midi.event,
+		patch,
+	}
+	return
 }
 
-func (midi *Midi) ReadPitchWheelEvent() error {
-	b1, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadPitchWheelEvent() (event MidiEvent, err error) {
+	var b1, b2 byte
+	if b1, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	b2, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if b2, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
 	if b1&0x80 != 0 {
-		return errInvalidPitchWheelByte
+		return nil, errInvalidPitchWheelByte
 	}
 	if b2&0x80 != 0 {
-		return errInvalidPitchWheelByte
+		return nil, errInvalidPitchWheelByte
 	}
-	pitch := b1 + (b2 << 7)
-	fmt.Printf(", Pitch_bend_c %d", pitch)
-	return nil
+	pitch := int(b1) + int(b2<<7)
+	event = &PitchWheelEvent{
+		midi.event,
+		pitch,
+	}
+	return
 }
 
-func (midi *Midi) ReadControlChangeEvent() error {
-	key, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadControlChangeEvent() (event MidiEvent, err error) {
+	var key, pressure byte
+	if key, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	pressure, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if pressure, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-
-	fmt.Printf(", Control_c, %d", key)
-	fmt.Printf(", %d", pressure)
-	return nil
+	event = &ControlChangeEvent{
+		midi.event,
+		key,
+		pressure,
+	}
+	return
 }
 
-func (midi *Midi) ReadNoteOnEvent() error {
-	key, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadNoteOnEvent() (event MidiEvent, err error) {
+	var key, velocity byte
+	if key, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	velocity, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if velocity, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-
-	fmt.Printf(", Note_on_c, %d", key)
-	fmt.Printf(", %d", velocity)
-	return nil
+	event = &NoteOnEvent{
+		midi.event,
+		key,
+		velocity,
+	}
+	return
 }
 
-func (midi *Midi) ReadNoteOffEvent() error {
-	key, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+func (midi *Midi) ReadNoteOffEvent() (event MidiEvent, err error) {
+	var key, velocity byte
+	if key, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	velocity, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if velocity, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-
-	fmt.Printf(", Note_off_c, %d", key)
-	fmt.Printf(", %d", velocity)
-	return nil
+	event = &NoteOffEvent{
+		midi.event,
+		key,
+		velocity,
+	}
+	return
 }
 
-func (midi *Midi) ReadMetaEvent() error {
+func (midi *Midi) ReadMetaEvent() (MidiEvent, error) {
 	metaEvent, err := midi.buffer.ReadByte()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	len, err := midi.ReadUVarInt()
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	fmt.Printf(", meta event %X", metaEvent)
-	fmt.Printf(", len %d", len)
 
 	switch metaEvent {
 	case MetaEventTrackSequenceNumber:
@@ -373,22 +372,16 @@ func (midi *Midi) ReadMetaEvent() error {
 		MetaEventCuePoint,
 		MetaEventProgramName,
 		MetaEventDeviceName:
-		str, err := midi.ReadTextEvent(len)
-		if err != nil {
-			return err
-		}
-		fmt.Printf(", [%s]", str)
-		return nil
+		return midi.ReadTextEvent(len)
 	case MetaEventMidiChannel:
-		panic(errNotImplemented)
+		return nil, errNotImplemented
 	case MetaEventMidiPort:
-		panic(errNotImplemented)
+		return nil, errNotImplemented
 	case MetaEventEndTrack:
 		if len != 0 {
-			return errInvalidTrackEndLength
+			return nil, errInvalidTrackEndLength
 		}
-		fmt.Printf(", End_track")
-		return nil
+		return nil, nil
 	case MetaEventSetTempo:
 		return midi.ReadTempoEvent(len)
 	case MetaEventSmpteOffset:
@@ -400,135 +393,146 @@ func (midi *Midi) ReadMetaEvent() error {
 	case MetaEventSequencerSpecific:
 		return midi.ReadSequencerSpecificEvent(len)
 	default:
-		return errInvalidMetaEventType
+		return nil, errInvalidMetaEventType
 	}
 }
 
-func (midi *Midi) ReadSequencerSpecificEvent(len uint64) error {
-	bytes, err := midi.ReadBytes(int(len))
-	if err != nil {
-		return err
+func (midi *Midi) ReadSequencerSpecificEvent(len uint64) (event MidiEvent, err error) {
+	var data []byte
+	if data, err = midi.ReadBytes(int(len)); err != nil {
+		return nil, err
 	}
-
-	fmt.Printf(", %v", bytes)
-	return nil
+	event = &SequencerSpecificEvent{
+		midi.event,
+		data,
+	}
+	return
 }
 
-func (midi *Midi) ReadSmpteOffsetEvent(len uint64) error {
+func (midi *Midi) ReadSmpteOffsetEvent(len uint64) (event MidiEvent, err error) {
 	if len != 5 {
-		panic(errInvalidSmpteOffset)
+		return nil, errInvalidSmpteOffset
 	}
-	hours, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	var hours, minutes, seconds, frames, subFrames byte
+	if hours, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	minutes, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if minutes, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	seconds, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if seconds, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	frames, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if frames, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	subFrames, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if subFrames, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	fmt.Printf(", hours %d", hours)
-	fmt.Printf(", minutes %d", minutes)
-	fmt.Printf(", seconds %d", seconds)
-	fmt.Printf(", frames %d", frames)
-	fmt.Printf(", subFrames %d", subFrames)
-	return nil
+	event = &SmpteOffsetEvent{
+		midi.event,
+		hours,
+		minutes,
+		seconds,
+		frames,
+		subFrames,
+	}
+	return
 }
 
-func (midi *Midi) ReadKeySignatureEvent(len uint64) error {
+func (midi *Midi) ReadKeySignatureEvent(len uint64) (event MidiEvent, err error) {
 	if len != 2 {
-		return errInvalidKeySignatureLen
+		return nil, errInvalidKeySignatureLen
 	}
-	sharpsFlats, err := midi.buffer.ReadByte() // sf=sharps/flats (-7=7 flats, 0=key of C,7=7 sharps)
-	if err != nil {
-		return err
+	var sharpsFlats, majorMinor byte
+	// sf=sharps/flats (-7=7 flats, 0=key of C,7=7 sharps)
+	if sharpsFlats, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
-	majorMinor, err := midi.buffer.ReadByte() // mi=major/minor (0=major, 1=minor)       }
-	if err != nil {
-		return err
+	// mi=major/minor (0=major, 1=minor)
+	if majorMinor, err = midi.buffer.ReadByte(); err != nil {
+		return nil, err
 	}
 
-	fmt.Printf(", sharps flats %d", sharpsFlats)
-	fmt.Printf(", major minor %d", majorMinor)
-	return nil
+	event = &KeySignatureEvent{
+		midi.event,
+		sharpsFlats,
+		majorMinor,
+	}
+	return
 }
 
-func (midi *Midi) ReadTimeSignatureEvent(len uint64) error {
+func (midi *Midi) ReadTimeSignatureEvent(len uint64) (event MidiEvent, err error) {
 	if len != 4 {
-		panic(errInvalidTimeSignatureLength)
+		return nil, errInvalidTimeSignatureLength
 	}
-	numerator, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	var numerator, denominator, ticksInMetronomeClick, no32ndNotesInQuarterNote byte
+	if numerator, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-	denominator, err := midi.buffer.ReadByte() //2=quarter, 3=eigth etc
-	if err != nil {
-		return err
+	//2=quarter, 3=eigth etc
+	if denominator, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-	ticksInMetronomeClick, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if ticksInMetronomeClick, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-	no32ndNotesInQuarterNote, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if no32ndNotesInQuarterNote, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
 
-	fmt.Printf(", numerator %d", numerator)
-	fmt.Printf(", denominator %d", denominator)
-	fmt.Printf(", ticks in metronome click %d", ticksInMetronomeClick)
-	fmt.Printf(", no 32nd notes in quarter note %d", no32ndNotesInQuarterNote)
-	return nil
+	event = &TimeSignatureEvent{
+		midi.event,
+		numerator,
+		denominator,
+		ticksInMetronomeClick,
+		no32ndNotesInQuarterNote,
+	}
+	return
 }
 
-func (midi *Midi) ReadTextEvent(len uint64) (string, error) {
-	if len == 0 {
-		return "", nil
-	} else {
-		b, err := midi.ReadBytes(int(len))
+func (midi *Midi) ReadTextEvent(len uint64) (event MidiEvent, err error) {
+	text := ""
+	if len > 0 {
+		var b []byte
+		b, err = midi.ReadBytes(int(len))
 		if err != nil {
-			return "", err
+			return
 		}
-		return string(b), nil
+		text = string(b)
 	}
+
+	event = &TextEvent{
+		midi.event,
+		text,
+	}
+	return
 }
 
-func (midi *Midi) ReadTempoEvent(len uint64) error {
+func (midi *Midi) ReadTempoEvent(len uint64) (event MidiEvent, err error) {
 	if len != 3 {
-		panic(errInvalidTempoLength)
+		return nil, errInvalidTempoLength
 	}
-	b1, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	var b1, b2, b3 byte
+	if b1, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-	b2, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if b2, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-	b3, err := midi.buffer.ReadByte()
-	if err != nil {
-		return err
+	if b3, err = midi.buffer.ReadByte(); err != nil {
+		return
 	}
-
-	microsecondsPerQuarterNote := (b1 << 16) + (b2 << 8) + b3
-
-	fmt.Printf(", microseconds per quarter note: %d", microsecondsPerQuarterNote)
-	return nil
+	microsecondsPerQuarterNote := int(b1<<16) + int(b2<<8) + int(b3)
+	event = &TempoEvent{
+		midi.event,
+		microsecondsPerQuarterNote,
+	}
+	return
 }
 
-func (midi *Midi) ReadTrackSequenceNumber(len uint64) error {
-	return errNotImplemented
+func (midi *Midi) ReadTrackSequenceNumber(len uint64) (event MidiEvent, err error) {
+	return nil, errNotImplemented
 }
 
 func (midi *Midi) ReadBytes(bytes int) ([]byte, error) {
@@ -567,7 +571,6 @@ func (midi *Midi) ReadMThdMarker() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s\n", buffer)
 	if string(buffer) != "MThd" {
 		return errInvalidHeader
 	}
@@ -579,7 +582,6 @@ func (midi *Midi) readMTrkMarker() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s\n", buffer)
 	if string(buffer) != "MTrk" {
 		return errInvalidHeader
 	}
